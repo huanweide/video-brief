@@ -6,6 +6,8 @@
 
 **不是摘要，是教学式重写。** 别人告诉你视频说了什么；本工具让你能学会它。
 
+> **Topics（GitHub 仓库标签建议）**：`video-summary` `bilibili` `subtitle` `asr` `teaching` `prompt-engineering` `html` `python` `learning` `knowledge-management` `chinese`
+
 ## 和「视频摘要工具」的区别
 
 视频摘要回答「它说了什么」，输出一份信息清单，读完你知道有这回事，
