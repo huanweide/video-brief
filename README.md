@@ -40,6 +40,11 @@ BV号 ──① 取字幕──> 原料字幕 ──② 清洗──> 纯文本 
 ```bash
 # 前置：仅在该视频无 CC 字幕时需要（ASR 用）
 export SILICONFLOW_API_KEY="你的key"
+# 同一场景还需要 ffmpeg / ffprobe 在 PATH 中（音频分块转码用）：
+#   Windows: winget install Gyan.FFmpeg  （或 ffmpeg.org 下载解压，bin 加入 PATH）
+#   macOS:   brew install ffmpeg
+#   Linux:   sudo apt install ffmpeg
+# 缺了不会撞系统错误——脚本会先预检，直接把上面的安装指引打给你。
 
 # 第一步：备料
 python video_brief.py BV1a14y187qn

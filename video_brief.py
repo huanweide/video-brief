@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 from datetime import datetime
 
@@ -43,6 +44,20 @@ _SRT_TIME = re.compile(                                             # SRT 时间
     r'^\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*'
     r'\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}')                              # "00:00:01,000 --> 00:00:03,000"
 _HTML_TAG = re.compile(r'<[^>]+>')                                  # <font color=...> 等标签残留
+# ASR 幻觉字符（v1.0.1 实跑教训）：SenseVoice 遇到纯音乐间奏/无人声片段时，
+# 会吐出日文假名、韩文字节和音乐符号当「文本」——路演、MV、课程片头全是这种。
+# 这些字符对总结零信息量，还会带偏 LLM。整行去完这些后若不含任何
+# 汉字/拉丁字母/数字，判定为幻觉行直接丢。
+_HALLUCINATION = re.compile(
+    '[\u3040-\u30ff\u31f0-\u31ff'      # 日文平假名 / 片假名 / 假名扩展
+    '\uac00-\ud7af'                    # 韩文字母音节（가-힣）
+    '\U0001F3BC'                       # 🎼
+    '\U0001F3B5-\U0001F3B9'            # 🎵🎶🎷🎸🎹
+    '\U0001F941'                       # 🥁
+    '\u2669-\u266c'                    # ♩♪♫♬
+    '\U0001D15E-\U0001D167'            # 𝄞-𝄧 音乐符号块
+    ']')
+_HAS_CONTENT = re.compile(r'[\u4e00-\u9fffA-Za-z0-9]')             # 汉字 / 拉丁字母 / 数字
 _SENT_END = '。！？!?…'                                             # 句末标点
 _QUOTE_END = '」』”）)"\''                                          # 后引号（句末标点+后引号也算段尾）
 _MIN_OVERLAP = 4          # 滚动重叠去重的最小长度：短于这个不切，防止误伤正常行文
@@ -89,14 +104,15 @@ def _para_end(s: str) -> bool:
 def clean_transcript(raw: str) -> str:
     """把字幕原料清洗成适合 LLM 阅读的纯文本。
 
-    处理四类问题：
+    处理五类问题：
     1. SRT 结构残留（序号行 + 时间戳行）——用户用 --subtitle 传入的可能是 SRT；
-    2. 相邻重复行——自动字幕滚动上屏的固有问题，见 _overlap_len 注释；
-    3. 过碎短句——CC 字幕一条常只有几个字，直接喂给 LLM 语义会断裂，
+    2. ASR 幻觉字符——纯音乐间奏被 SenseVoice 转成日韩假名/音乐符号，见 _HALLUCINATION 注释；
+    3. 相邻重复行——自动字幕滚动上屏的固有问题，见 _overlap_len 注释；
+    4. 过碎短句——CC 字幕一条常只有几个字，直接喂给 LLM 语义会断裂，
        按「句末标点或长度上限」合并成自然段；
-    4. 空白噪声——连续空格、全角空格、首尾空白、中文标点前的多余空格。
+    5. 空白噪声——连续空格、全角空格、首尾空白、中文标点前的多余空格。
     """
-    # --- 第一遍：逐行去结构、去标签、归一化空白 ---
+    # --- 第一遍：逐行去结构、去标签、去 ASR 幻觉、归一化空白 ---
     lines = []
     for ln in raw.splitlines():
         ln = ln.strip()
@@ -107,6 +123,11 @@ def clean_transcript(raw: str) -> str:
         if _SRT_TIME.match(ln):         # SRT 时间戳行
             continue
         ln = _HTML_TAG.sub('', ln)      # 去 <font>/<i> 等标签残留
+        ln = _HALLUCINATION.sub('', ln) # 去日韩假名/音乐符号（ASR 对纯音乐段的幻觉）
+        # 去完幻觉字符后，这一行若没有任何 汉字/字母/数字，就是纯噪音行，整行丢。
+        # 宁保守勿激进：只要还剩一个汉字或字母就保留（歌词、中英混排都在保护范围）。
+        if not _HAS_CONTENT.search(ln):
+            continue
         ln = re.sub(r'\s+', ' ', ln)    # 行内连续空白（含全角空格）压成一个
         ln = ln.strip()
         if ln:
@@ -187,6 +208,26 @@ def fmt_duration(seconds) -> str:
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _require_ffmpeg() -> None:
+    """ASR 路径的前置依赖预检（v1.0.1 实跑教训）。
+
+    无 CC 字幕时，参照一会走「下载音频 → ffmpeg/ffprobe 分块转码 → ASR」。
+    这两个可执行文件不在 PATH 上时，下游抛的是 WinError 2 这类操作系统级
+    错误，用户完全看不出缺什么、去哪装。在上游就检掉，给一条能照着做的
+    安装指引——错误信息也是产品体验的一部分。
+    """
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing:
+        raise RuntimeError(
+            f"该视频无 CC 字幕，转写需要 {' 和 '.join(missing)}，但未在 PATH 中找到。\n"
+            "  安装方式（任选一，装完重开终端让 PATH 生效）：\n"
+            "    Windows:  winget install Gyan.FFmpeg\n"
+            "              （或到 ffmpeg.org 下载解压，把 bin 目录加入 PATH）\n"
+            "    macOS:    brew install ffmpeg\n"
+            "    Linux:    sudo apt install ffmpeg\n"
+            "  也可以先用 --subtitle 提供已有字幕文件跳过这一步。")
 
 
 def safe_name(s: str) -> str:
@@ -274,6 +315,10 @@ def run(bvid: str, out_root: str = None, subtitle_file: str = None,
                 "该视频没有 CC 字幕，需要走 ASR，但环境变量 "
                 "SILICONFLOW_API_KEY 未设置。请设置后重试，"
                 "或用 --subtitle 提供已有字幕文件")
+        if not probe:
+            # 无字幕 = 必然走 ASR = 必然要 ffmpeg 分块。先检掉，
+            # 别让用户撞上 WinError 2 这种看不懂的系统错误。
+            _require_ffmpeg()
         source = "cc" if probe else "asr"
         ext_dir = mod.extract(bvid, page_num)   # 有字幕直接下，无字幕 DASH+ASR
         with open(os.path.join(ext_dir, "subtitle.txt"), "r", encoding="utf-8") as f:

@@ -1,10 +1,19 @@
 # video-brief 构建报告
 
-构建时间：2026-10-17 ｜ 构建者：Agent（CodeBuddy）｜ 状态：**已完成并通过全部验证**
+构建时间：2026-10-17 ｜ 构建者：Agent（CodeBuddy）｜ 状态：**v1.0.1 · 三条路径全部实跑验证**
+
+> **v1.0.1 实跑补记（2026-10-17 08:36）**：用真实无字幕视频 `BV1UF411675T`
+> （柳州随机舞蹈路演，3 分 23 秒）实跑 ASR 全链路，抓到并修复 2 个问题——
+> ① 缺 ffmpeg 时用户看到的是 `WinError 2`（系统级错误，看不出缺什么），
+> 已加 `_require_ffmpeg()` 预检，报错带 winget/brew/apt 安装指引；
+> ② SenseVoice 把纯音乐间奏转成日韩假名+音乐符号幻觉（`🎼아じ`）直接进
+> LLM 原料，已加 `_HALLUCINATION` 逐行过滤（去完后无 汉字/字母/数字 才丢，
+> 宁保守勿激进——中英混排歌词在保护范围）。测试 24 → 30 项，全绿。
+> 详细实跑记录见第六节。
 
 ## 一、交付物
 
-目录 `C:\Users\Administrator\.workbuddy\skills\video-brief\`，共 8 个文件：
+目录 `C:\Users\Administrator\.workbuddy\skills\video-brief\`，共 9 个文件：
 
 | 文件 | 职责 |
 |---|---|
@@ -15,7 +24,7 @@
 | `prompts/brief-user.md` | 用户提示词模板，占位符 `{title} {up_name} {duration} {tname} {url} {subtitle_note} {transcript}` |
 | `assets/style.css` | 浅色清爽主题：720px 居中、中文字体栈、代码块浅灰圆角、表格斑马纹、引用块左竖线。无暗色/渐变/动画 |
 | `README.md` | 中文说明：定位、与摘要工具的区别、三步流程、快速开始、输出结构、当前不能做什么、设计取舍 |
-| `tests/test_render.py` | 纯标准库 unittest，24 个用例 |
+| `tests/test_render.py` | 纯标准库 unittest，30 个用例（24 转换 + 3 幻觉过滤 + 3 ffmpeg 预检） |
 
 ## 二、关键设计决策
 
@@ -51,14 +60,17 @@
 |---|---|
 | `python video_brief.py --help` | 跑通（不抓视频） |
 | `python render.py --help` | 跑通 |
-| `python tests/test_render.py` | **24 个用例全 OK** |
+| `python tests/test_render.py` | **30 个用例全 OK**（v1.0.1 起） |
 | 端到端冒烟（本地 SRT → 清洗 → 输入包 → 示例 brief.md → HTML） | 通过，14 项内容断言全 PASS（占位符全部填掉、提示词铁律齐全、元信息正确） |
+| **真实 ASR 全链路实跑**（BV1UF411675T，无 CC 字幕） | 通过：元信息 → DASH 下载音频（4.5MB）→ ffmpeg 转码 → 硅基流动 ASR → 清洗（幻觉过滤后 104 字）→ 输入包 → render.py 出单文件 HTML |
+| **ffmpeg 缺失预检实跑** | 通过：同一视频在无 ffmpeg 环境报友好指引（winget install Gyan.FFmpeg / brew / apt），不再是 WinError 2 |
 | 产出 HTML 结构断言 | 14 项全 PASS（单文件无外链、信息头五要素、h2/代码块/表格/粗体/列表/行内代码、ASCII 图原样保留、浅色主题） |
 | 凭据泄漏扫描（`sk-` 模式 / 硬编码 key） | 无匹配；key 只从环境变量读 |
-| git 操作 | 无（未 init/commit/push） |
+| git 操作 | 已 init + commit（v1.0.0 root commit 0a036 前 → v1.0.1） |
 
 冒烟测试用的 BV 号 `BV1GJ411x7h7` 为随手取的一个公开视频（只调了 B站公开
 view API 读元信息），冒烟产物在 `%TEMP%\vb-smoke\`，已清理。
+ASR 实跑产物在 `output/`（已被 .gitignore 排除，仅本地验证用）。
 
 ## 四、已知边界与没做的部分
 
@@ -75,5 +87,36 @@ view API 读元信息），冒烟产物在 `%TEMP%\vb-smoke\`，已清理。
 4. **只支持 B站**：YouTube 二期（README 已声明）。
 5. **画面信息（PPT/代码/白板）拿不到**：已在提示词和 README 中声明处理方式
    （标注而非编造），这是字幕路线的固有边界。
-6. **无字幕路径未实测**：依赖 `ffmpeg`/`ffprobe` + `SILICONFLOW_API_KEY`，
-   该路径复用的是参照一已验证的代码，本次未实跑 ASR（无可离线验证的条件）。
+6. ~~**无字幕路径未实测**~~（v1.0.1 已实测，见第六节实跑记录）。
+
+## 六、v1.0.1 实跑记录（2026-10-17 08:36）
+
+**测试对象**：`BV1UF411675T`「【8.24柳州保利随机舞蹈路演】Love Me A Little」，
+3 分 23 秒，无 CC 字幕（探测字幕轨 = 0），音乐占比高——刻意选的路演视频，
+因为这类内容最能暴露 ASR 链路的问题。
+
+**环境修复**：本机原本没有 ffmpeg（`which ffmpeg` 无结果），这本身就是第一个
+「用户撞墙」场景。已安装 ffmpeg 9.0.2 到 `C:\tools` 并写入用户 PATH。
+
+**实跑过程与抓到的问题**：
+
+1. **第一次实跑直接失败**：`[FAILED] [WinError 2] 系统找不到指定的文件`——
+   缺 ffmpeg。下游（参照一的 extract）直接把操作系统级错误抛给用户，
+   没有任何「缺什么、去哪装」的信息。**修复**：`_require_ffmpeg()` 预检，
+   报错含 winget/brew/apt 三种安装命令 + `--subtitle` 逃生口。
+2. **ffmpeg 装好后 ASR 全链路跑通**：4.5MB 音频 → 转码 → SenseVoice 转写 →
+   清洗后 104 字。
+3. **第二次抓到的质量问题（更隐蔽）**：清洗后的字幕里混着
+   `🎼以见我。아.🎼Inじ。Okay。`——SenseVoice 把纯音乐间奏转成了日文假名、
+   韩文字节和音乐符号。这些字符对总结零价值，还会带偏 LLM。
+   **修复**：`_HALLUCINATION` 逐行过滤；**判据刻意保守**——去完幻觉字符后
+   只要还剩一个汉字/字母/数字就保留该行，只有纯噪音行才丢。
+   这样中英混排歌词（"Love Me A Little"）、中文歌词都在保护范围。
+   实测重跑后：`以见我。.In。.Okay。六十。你不能感觉。散就伞爱流过的美。`
+   ——幻觉全清，正文一字未伤。
+4. **render 路径验证**：手工写了一份教学式总结 brief.md（含一句话定位/
+   章节推导/列表/待核对清单），render.py 生成 5.4KB 单文件 HTML，
+   CSS 内联、信息头五要素齐全，与冒烟测试的 14 项断言一致。
+
+**仍未闭环的**：「真实 Agent 按提示词写总结」的质量验收——提示词经过与
+教学提示词 v2.0 铁律逐条对照，但首次真实使用时建议抽查一份对照铁律清单。

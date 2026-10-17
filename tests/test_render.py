@@ -193,6 +193,67 @@ class TestCleanTranscript(unittest.TestCase):
         self.assertEqual(clean(""), "")
         self.assertEqual(clean("\n\n  \n"), "")
 
+    def test_asr_music_hallucination_stripped(self):
+        # v1.0.1 实跑教训：路演视频的纯音乐间奏被 SenseVoice 转成日韩假名+音乐符号
+        clean = self._clean()
+        out = clean("🎼以见我。아.🎼Inじ。Okay。六十。🎼你不能感觉。散就伞爱流过的美。")
+        self.assertNotIn("아", out)          # 韩文幻觉去掉
+        self.assertNotIn("じ", out)          # 日文假名幻觉去掉
+        self.assertNotIn("🎼", out)          # 音乐符号去掉
+        self.assertIn("以见我", out)         # 正文不误伤
+        self.assertIn("你不能感觉", out)
+
+    def test_pure_music_line_dropped(self):
+        # 整行没有任何 汉字/字母/数字 → 纯噪音行，直接丢
+        clean = self._clean()
+        out = clean("🎼♪♫♩\n🎼🎵\n。，、！")
+        self.assertEqual(out.strip(), "")
+
+    def test_lyric_line_kept(self):
+        # 中文歌词、中英混排是正常内容，不能误删
+        clean = self._clean()
+        out = clean("🎼 我不能感觉 散就伞爱流过的美 🎵 Love Me A Little")
+        self.assertIn("我不能感觉", out)
+        self.assertIn("Love Me A Little", out)
+
+
+class TestRequireFfmpeg(unittest.TestCase):
+    """ASR 前置依赖预检（v1.0.1 实跑教训：缺 ffmpeg 时下游报 WinError 2，用户看不懂）。"""
+
+    def _require(self):
+        import video_brief
+        return video_brief._require_ffmpeg
+
+    def test_missing_raises_with_install_hint(self):
+        from unittest import mock
+        import video_brief
+        with mock.patch.object(video_brief.shutil, "which", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._require()()
+        msg = str(ctx.exception)
+        self.assertIn("ffmpeg", msg)
+        self.assertIn("ffprobe", msg)
+        # 报错必须给得出「照着做」的指引，而不是只报缺什么
+        self.assertIn("winget install Gyan.FFmpeg", msg)
+        self.assertIn("--subtitle", msg)
+
+    def test_present_passes(self):
+        from unittest import mock
+        import video_brief
+        with mock.patch.object(video_brief.shutil, "which",
+                               return_value="C:/ffmpeg/bin/ffmpeg.exe"):
+            self._require()()   # 两个都在，不抛
+
+    def test_partial_missing_names_the_tool(self):
+        from unittest import mock
+        import video_brief
+        def fake_which(tool):
+            return "C:/ffmpeg/bin/ffmpeg.exe" if tool == "ffmpeg" else None
+        with mock.patch.object(video_brief.shutil, "which", side_effect=fake_which):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._require()()
+        self.assertIn("ffprobe", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
