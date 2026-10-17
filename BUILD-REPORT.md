@@ -1,6 +1,15 @@
 # video-brief 构建报告
 
-构建时间：2026-10-17 ｜ 构建者：Agent（CodeBuddy）｜ 状态：**v1.0.1 · 三条路径全部实跑验证**
+构建时间：2026-10-17 ｜ 构建者：Agent（CodeBuddy）｜ 状态：**v1.1.0 · 67 项测试全绿 + 4/4 变异拦截**
+
+> **v1.1.0 升级记（2026-10-17 夜间 maxloop）**：三个新能力——① 输入放宽到
+> BV号/av号/任意 B站链接（`?p=N` 自动认分P）；② 字幕清洗支持 VTT（WEBVTT 头/
+> NOTE 块/cue 标识符/HTML 实体，`&amp;` 最后解防二次解码）；③ 长视频自动
+> 分段走两阶段提取（map-reduce）：每段一份提示词提炼成分段笔记，N 份笔记
+> 归并成终稿。实跑前抓到并修复 1 个真 bug：`parse_video_ref` 原实现对 BV 号
+> 整串 `upper()`，实测 `bvid=BV1A14Y187QN` → API `code -404`——BV 号大小写
+> 敏感，整串大写化等于把用户输入改成查不到的 ID。已改为前缀规范化 + 后缀
+> 原样保留，并补回归测试。测试 30 → 67 项。详细记录见第七节。
 
 > **v1.0.1 实跑补记（2026-10-17 08:36）**：用真实无字幕视频 `BV1UF411675T`
 > （柳州随机舞蹈路演，3 分 23 秒）实跑 ASR 全链路，抓到并修复 2 个问题——
@@ -13,18 +22,21 @@
 
 ## 一、交付物
 
-目录 `C:\Users\Administrator\.workbuddy\skills\video-brief\`，共 9 个文件：
+目录 `C:\Users\Administrator\.workbuddy\skills\video-brief\`，共 11 个文件：
 
 | 文件 | 职责 |
 |---|---|
-| `SKILL.md` | skill 入口：frontmatter（description 含「BV号/B站/视频总结/视频讲解/这个视频/总结这个视频/拆解这个视频/这个视频讲了什么」触发词）+ 三步流程 + 前置条件 + 输出结构 |
-| `video_brief.py` | 主脚本：BV号 → 复用 bili-subtitle-extractor 拿字幕 → `clean_transcript()` 清洗 → 输出「总结用输入包」。不写总结内容 |
+| `SKILL.md` | skill 入口：frontmatter（description 含「BV号/av号/链接/视频总结/视频讲解/这个视频讲了什么」触发词）+ 三步流程 + 分段模式 + 前置条件 + 输出结构 |
+| `video_brief.py` | 主脚本：BV号/av号/链接 → 复用 bili-subtitle-extractor 拿字幕 → `clean_transcript()` 清洗 → 输出「总结用输入包」。不写总结内容 |
 | `render.py` | markdown → 单文件 HTML（CSS 内联）。内置轻量 markdown 转换器，零第三方依赖 |
 | `prompts/brief-system.md` | 给 Agent 的系统提示词（约 4.4k 字），教学方法论 v2.0 的「视频总结子集」 |
-| `prompts/brief-user.md` | 用户提示词模板，占位符 `{title} {up_name} {duration} {tname} {url} {subtitle_note} {transcript}` |
+| `prompts/brief-user.md` | 单包模式用户提示词模板，占位符 `{title} {up_name} {duration} {tname} {url} {subtitle_note} {transcript}` |
+| `prompts/brief-chunk-user.md` | 分段笔记提示词（v1.1）：五栏位 schema（覆盖范围/核心概念/关键论证/衔接点/转写存疑），明令禁止写全局总结 |
+| `prompts/brief-merge-user.md` | 归并提示词（v1.1）：跨段重组、去重、存疑保留、缺口承认，终稿质量不打折 |
 | `assets/style.css` | 浅色清爽主题：720px 居中、中文字体栈、代码块浅灰圆角、表格斑马纹、引用块左竖线。无暗色/渐变/动画 |
-| `README.md` | 中文说明：定位、与摘要工具的区别、三步流程、快速开始、输出结构、当前不能做什么、设计取舍 |
+| `README.md` | 中文说明：定位、与摘要工具的区别、三步流程、快速开始、输出结构（单包/分段）、当前不能做什么、设计取舍 |
 | `tests/test_render.py` | 纯标准库 unittest，30 个用例（24 转换 + 3 幻觉过滤 + 3 ffmpeg 预检） |
+| `tests/test_video_brief.py` | 纯标准库 unittest（v1.1），37 个用例：输入解析/实体解码/VTT 清洗/分段切块/提示词组装/端到端集成（mock 提取器零网络） |
 
 ## 二、关键设计决策
 
@@ -61,7 +73,10 @@
 | `python video_brief.py --help` | 跑通（不抓视频） |
 | `python render.py --help` | 跑通 |
 | `python tests/test_render.py` | **30 个用例全 OK**（v1.0.1 起） |
+| `python tests/test_video_brief.py` | **37 个用例全 OK**（v1.1 新增：输入解析 12 + 实体解码 4 + VTT 清洗 6 + 分段切块 8 + 提示词组装 3 + 端到端集成 4） |
+| **变异验证**（v1.1） | 4/4 拦截：前缀规范化 / `&amp;` 解码顺序 / 硬切保底 / 分段触发，注入缺陷后对应对应变红（详见第七节） |
 | 端到端冒烟（本地 SRT → 清洗 → 输入包 → 示例 brief.md → HTML） | 通过，14 项内容断言全 PASS（占位符全部填掉、提示词铁律齐全、元信息正确） |
+| **长视频分段端到端**（v1.1，离线 mock 提取器） | 通过：400 条 VTT cue → 清洗后 19599 字 → 2 段，产物结构/占位符替换/notes 覆盖度/阈值关闭四路断言全 PASS |
 | **真实 ASR 全链路实跑**（BV1UF411675T，无 CC 字幕） | 通过：元信息 → DASH 下载音频（4.5MB）→ ffmpeg 转码 → 硅基流动 ASR → 清洗（幻觉过滤后 104 字）→ 输入包 → render.py 出单文件 HTML |
 | **ffmpeg 缺失预检实跑** | 通过：同一视频在无 ffmpeg 环境报友好指引（winget install Gyan.FFmpeg / brew / apt），不再是 WinError 2 |
 | 产出 HTML 结构断言 | 14 项全 PASS（单文件无外链、信息头五要素、h2/代码块/表格/粗体/列表/行内代码、ASCII 图原样保留、浅色主题） |
@@ -88,6 +103,9 @@ ASR 实跑产物在 `output/`（已被 .gitignore 排除，仅本地验证用）
 5. **画面信息（PPT/代码/白板）拿不到**：已在提示词和 README 中声明处理方式
    （标注而非编造），这是字幕路线的固有边界。
 6. ~~**无字幕路径未实测**~~（v1.0.1 已实测，见第六节实跑记录）。
+7. **真实长视频分段未端到端实跑**（v1.1）：分段逻辑与产物结构经离线 mock
+   全断言覆盖，但「真实网络取字幕 → 清洗真实 VTT → 分段」的组合链路待跑
+   （见第七节末）。分段/归并提示词的真实 Agent 产出质量同待验收。
 
 ## 六、v1.0.1 实跑记录（2026-10-17 08:36）
 
@@ -120,3 +138,58 @@ ASR 实跑产物在 `output/`（已被 .gitignore 排除，仅本地验证用）
 
 **仍未闭环的**：「真实 Agent 按提示词写总结」的质量验收——提示词经过与
 教学提示词 v2.0 铁律逐条对照，但首次真实使用时建议抽查一份对照铁律清单。
+
+---
+
+## 七、v1.1.0 实跑记录（2026-10-17 夜间 maxloop）
+
+**升级范围**：VTT 字幕支持 + BV号/av号/链接输入 + 长视频 map-reduce 分段。
+
+**测试先行的收获——测试抓到一个真 bug**：写 `parse_video_ref` 测试时发现
+原实现（本版本之前一晚的初版）对 BV 号整串 `upper()`。实测 B站 API：
+
+```
+bvid=BV1a14y187qn → {"code":0,...,"data":{...}}    canonical 大小写，通
+bvid=BV1A14Y187QN → {"code":-404,"message":"啥都木有"}   整串大写，404
+```
+
+BV 号大小写敏感，`.upper()` 把用户输入改成了查不到的 ID。同时小写前缀
+`bv...` 原本直接报「无法识别」。**修复**：前缀大小写不敏感匹配并规范成
+`BV`，后缀 10 个字符原样保留（参照实现 bili-subtitle-extractor 也是原样
+透传）。补两条回归测试（`test_bvid_case_insensitive` /
+`test_suffix_case_preserved`）。
+
+**变异验证（4/4 拦截）**：按「任何源码断言必须注 bug 验证能变红」的纪律，
+逐个注入缺陷确认测试有效——
+
+| 变异 | 注入的缺陷 | 被哪条测试抓住 |
+| --- | --- | --- |
+| 1 | 删掉 BV 前缀规范化 | `test_bvid_case_insensitive` FAIL |
+| 2 | `&amp;` 实体挪到最前解（二次解码） | `test_amp_decodes_last` FAIL |
+| 3 | 删掉单句超限的硬切保底 | `test_single_sentence_hard_cut` FAIL |
+| 4 | 强制 `chunked=False` 不触发分段 | 分段模式 2 条集成测试 ERROR |
+
+**测试设计中的两个自身错误（已修）**：① 测试数据 `BV1test0001` 只有 11 位
+（BV + 9 字符），不满足 `BV+10` 模式，5 条集成测试全 ERROR——改用合规的
+`BV1tst000001`；② 300 条 cue 清洗后 14699 字，差 301 字没够 15000 阈值，
+分段没触发——加到 400 条（清洗后约 19600 字，稳定 2 段）。**教训：阈值型
+功能的测试数据要留足余量，贴着边界写数据等于把测试绑死在当前阈值上。**
+
+**端到端实跑（离线 mock 路径）**：400 条 VTT cue → 清洗后 19599 字 →
+2 段（14992 + 4604）。产物结构验证通过：`chunks/chunk-1.md`/`chunk-2.md` 各含
+「第一部分 system + 第二部分 user」完整提示词与「第 N 段 / 共 2 段」标注；
+`brief-merge.md` 含归并要求与占位说明（`{chunk_notes}` 字面量已被替换）；
+`brief-input.md` 为两步流程使用说明；`meta.json` 的
+`chunked=true, chunk_count=2, chunk_chars=15000`。另验证「各 chunk 字幕块
+按序拼接 == transcript 全文」（一块不丢一块不多）与「`--chunk-chars 0`
+显式关闭分段回到单包」。
+
+**分段切块规则**（`split_transcript`）：段尾（空行）优先打包 → 单段超限按
+句末标点切 → 单句仍超限才硬切。绝不从半句话中间下刀——Agent 读到半句话会
+顺着猜，猜出来的内容会以「视频里说过」的身份混进总结。三条路径都有测试
+钉住（打包不超限/句末切/硬切等长）。
+
+**未做实跑的部分**：真实网络全链路（取字幕→清洗→分段）尚未对真实长视频
+跑过——离线 mock 覆盖了分段逻辑与产物结构，但 `extract()` 真实返回 +
+清洗真实 VTT 的组合留待下次实跑。归并提示词与分段提示词的真实 Agent
+产出质量同样待验收（与 v1.0.1 同一项遗留）。

@@ -1,6 +1,7 @@
 # video-brief · 视频总结器
 
-输入一个 B站 BV 号，拿到字幕，按教学方法论写一份教学式总结，渲染成一份清爽的单文件 HTML。
+输入一个 B站 BV号/av号/视频链接，拿到字幕，按教学方法论写一份教学式总结，
+渲染成一份清爽的单文件 HTML。长视频自动分段做两阶段提取，不丢中段。
 
 ## 一句话定位
 
@@ -30,12 +31,18 @@ BV号 ──① 取字幕──> 原料字幕 ──② 清洗──> 纯文本 
 ```
 
 1. **取字幕**：复用 `bili-subtitle-extractor` 的链路——有 CC 字幕直接下载，
-   没有则下载音频走硅基流动 ASR。脚本不重写字幕链路。
+   没有则下载音频走硅基流动 ASR。脚本不重写字幕链路。输入支持 BV号/av号/
+   任意 B站链接（带 `?p=N` 自动认分P）；字幕文件 `.srt`/`.vtt` 都认。
 2. **清洗**：`video_brief.py` 的 `clean_transcript()` 负责把字幕原料变成
-   适合 LLM 阅读的纯文本：去时间戳、去自动字幕滚动重复、合并过碎短句、
-   归一化空白。同时生成视频元信息和填好占位符的提示词输入包。
+   适合 LLM 阅读的纯文本：去时间戳、去 VTT/SRT 结构残留、去自动字幕滚动重复、
+   合并过碎短句、归一化空白。同时生成视频元信息和填好占位符的提示词输入包。
 3. **总结 + 渲染**：把输入包交给任意 LLM Agent 写总结（markdown），
    `render.py` 渲染成 CSS 内联的单文件 HTML，拷走一个文件就能看。
+
+**长视频自动分段（v1.1）**：清洗后字幕超过 15000 字（`--chunk-chars` 可调），
+单 prompt 塞整节课要么爆上下文、要么模型 lost-in-the-middle 丢中段。
+此时自动切成两阶段：每段一份提示词单独提炼成分段笔记，再把 N 份笔记
+归并成终稿。这是 bili-subtitle 项目验证过的 map-reduce 路子。
 
 ## 快速开始
 
@@ -60,21 +67,50 @@ python render.py output/BV1a14y187qn_标题/brief.md
 # 产出同目录 brief.html
 ```
 
-已有字幕文件时跳过抓取：
+已有字幕文件时跳过抓取（`.srt`/`.vtt` 均可）：
 
 ```bash
-python video_brief.py BV1a14y187qn --subtitle ./已有字幕.srt
+python video_brief.py BV1a14y187qn --subtitle ./已有字幕.vtt
+```
+
+链接/av号/分段阈值（v1.1）：
+
+```bash
+python video_brief.py https://www.bilibili.com/video/BV1a14y187qn/?p=3  # 链接带分P
+python video_brief.py av170001                                        # av号（自动转BV）
+python video_brief.py BV1a14y187qn --chunk-chars 20000                # 自定义分段阈值
+python video_brief.py BV1a14y187qn --chunk-chars 0                    # 关闭分段，强制单包
 ```
 
 ## 输出结构
 
+单包模式（短视频，默认）：
+
 ```
 output/BV号_标题/
 ├── transcript.txt   清洗后的纯文本字幕（Agent 的原料）
-├── meta.json        视频元信息（标题/UP主/时长/分区/简介/来源）
+├── meta.json        视频元信息（标题/UP主/时长/分区/简介/来源/分段信息）
 ├── brief-input.md   完整提示词（system + user，Agent 直接拿着用）
 ├── brief.md         Agent 写的教学式总结（需自行保存到此）
 └── brief.html       render.py 产出的单文件 HTML
+```
+
+分段模式（长视频，超过 `--chunk-chars` 自动触发）：
+
+```
+output/BV号_标题/
+├── transcript.txt      全量字幕留档（不直接进提示词）
+├── meta.json           chunked=true，带 chunk_count/chunk_chars
+├── chunks/
+│   ├── chunk-1.md      第 1 段提示词（system + user，产出分段笔记）
+│   ├── ...
+│   ├── chunk-N.md
+│   ├── note-1.md       分段笔记（跑 Agent 后自行保存到此）
+│   └── ...
+├── brief-merge.md      归并提示词：把 N 份笔记按序贴进「分段笔记」一节出终稿
+├── brief-input.md      使用说明（两步流程）
+├── brief.md            最终教学式总结（需自行保存到此）
+└── brief.html          render.py 产出的单文件 HTML
 ```
 
 `brief.html` 顶部自动生成视频信息头：标题、UP主、BV号、原视频链接、生成时间。
@@ -101,3 +137,13 @@ output/BV号_标题/
 **为什么输出 HTML。** 单文件（CSS 内联进 `<style>`），拷走一个文件就能看，
 不发依赖、不掉样式；浅色清爽主题为长文阅读设计，能安静读完一篇几千字；
 可分享、可沉淀，将来可以批量归档成个人知识库。
+
+**为什么长视频要分段（v1.1）。** 一节 40-60 分钟的课清洗后约 1.5-2 万字，
+塞进一个 prompt 有两个败法：爆上下文直接失败，或者模型 lost-in-the-middle
+把中段讲的内容丢干净——而中段往往是承重墙。切段后每块单独提炼成分段笔记
+（小产出），再用小得多的输入做归并（小输入），两阶段都避开这两个坑。
+分段提示词（`prompts/brief-chunk-user.md`）明令禁止写全局总结——每一段
+只看得见自己那块，没资格对全片下结论；归并提示词
+（`prompts/brief-merge-user.md`）负责去重、跨段重组、保留存疑、承认缺口。
+切点优先落在段尾，单段超限按句末标点切，绝不从半句话中间下刀——
+Agent 读到半句话会顺着猜，猜出来的内容会以「视频里说过」的身份混进总结。

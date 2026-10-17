@@ -1,17 +1,26 @@
 """
 video-brief · 视频总结器（第一步：备料）
-BV号 → 拿字幕（复用 bili-subtitle-extractor）→ 清洗 → 生成「总结用输入包」
+BV号/av号/B站链接 → 拿字幕（复用 bili-subtitle-extractor）→ 清洗 → 生成「总结用输入包」
 
 职责边界：本脚本不写总结内容。总结是 Agent 的活，本脚本只负责把原料备干净：
   1. transcript.txt   清洗后的纯文本字幕（给 Agent 读）
   2. meta.json        视频元信息（标题/UP主/时长/分区/简介）
   3. brief-input.md   填好占位符的完整提示词（system + user），Agent 直接拿着用
 
+v1.1 起：长视频（清洗后超过 --chunk-chars 字，默认 15000）自动切段，
+走两阶段提取（map-reduce）：每段一份 chunk-N.md 单独提炼成分段笔记，
+再用 brief-merge.md 把 N 份笔记归并成终稿。长视频单 prompt 要么爆上下文，
+要么模型 lost-in-the-middle 丢中段——这是 bili-subtitle 项目验证过的路子。
+
 用法:
   python video_brief.py BV1xxxxxxx
   python video_brief.py BV1xxxxxxx --out ./myout
-  python video_brief.py BV1xxxxxxx --subtitle ./已有字幕.srt
+  python video_brief.py BV1xxxxxxx --subtitle ./已有字幕.srt      # .srt/.vtt 均可
   python video_brief.py BV1xxxxxxx --page 3
+  python video_brief.py https://www.bilibili.com/video/BV1xx/?p=3 # v1.1：链接/av号也行
+  python video_brief.py av170001                                 # v1.1：av号（自动转BV）
+  python video_brief.py BV1xxxxxxx --chunk-chars 20000           # v1.1：自定义分段阈值
+  python video_brief.py BV1xxxxxxx --chunk-chars 0               # v1.1：关闭分段，强制单包
 """
 import argparse
 import importlib.util
@@ -33,6 +42,101 @@ EXTRACTOR_PY = next((p for p in EXTRACTOR_CANDIDATES if p and os.path.isfile(p))
 
 BV_RE = re.compile(r'^BV[a-zA-Z0-9]{10}$')
 VIDEO_URL = "https://www.bilibili.com/video/{bvid}"
+
+# v1.1 长视频分段：超过这个字数就切段做 map-reduce，不把整节课塞进一个 prompt。
+# 为什么是 15000：一节 40-60 分钟的课清洗后约 1.5-2 万字，一次总结要么爆上下文，
+# 要么模型「lost in the middle」丢掉中段。切段后每块单独提炼成分段笔记，
+# 再用小得多的输入做归并——这是 bili-subtitle 项目验证过的两阶段提取。
+DEFAULT_CHUNK_CHARS = 15000
+
+# HTML 实体（VTT/SSA 字幕常见）：&amp; 必须最后解，否则 '&amp;lt;' 会被解成 '<'，
+# 等于把转义内容还原成标签——这是 bili-subtitle-universal v9.0.1 的教训。
+_ENTITIES = [
+    ('&lt;', '<'), ('&gt;', '>'), ('&quot;', '"'),
+    ('&#39;', "'"), ('&apos;', "'"), ('&nbsp;', ' '),
+    ('&amp;', '&'),      # 放最后，防二次解码
+]
+
+
+def parse_video_ref(ref: str):
+    """把用户输入解析成 (kind, id, page)。kind ∈ {'bv', 'av'}。
+
+    接受：BV号 / av号 / 二者任意形式的 B站链接（可带 ?p=N）。
+    纯函数不碰网络——av 号转 BV 要调接口，那件事在 run() 里做。
+
+    大小写规则（实测结论，别改）：B站 API 对 BV 号大小写敏感——
+    bvid=BV1a14y187qn 返回 code 0，整串大写成 BV1A14Y187QN 返回
+    code -404。所以前缀「BV/bv」大小写不敏感地匹配并规范成大写，
+    后缀 10 个字符一律原样保留，绝不做整串 upper()。
+    """
+    ref = (ref or '').strip()
+    if not ref:
+        raise ValueError("输入为空：请给 BV号、av号或 B站视频链接")
+    page = None
+    m = re.search(r'[?&]p=(\d+)', ref)
+    if m:
+        page = int(m.group(1))
+    m = re.search(r'(BV[a-zA-Z0-9]{10})', ref, re.I)
+    if m:
+        bvid = m.group(1)
+        if not bvid.startswith('BV'):       # bv/Bv/bV → BV，后缀原样
+            bvid = 'BV' + bvid[2:]
+        return ('bv', bvid, page)
+    m = re.search(r'\bav(\d+)\b', ref, re.I)
+    if m:
+        return ('av', m.group(1), page)
+    raise ValueError(f"无法从 '{ref}' 识别 BV号/av号/B站链接")
+
+
+def _unescape_entities(s: str) -> str:
+    """解码常见 HTML 实体（见 _ENTITIES 注释：&amp; 最后解）。"""
+    for k, v in _ENTITIES:
+        s = s.replace(k, v)
+    return s
+
+
+def split_transcript(text: str, max_chars: int) -> list:
+    """按自然段边界把长字幕切块，单块尽量不超 max_chars。
+
+    切点优先落在段尾（空行）；单段本身就超限时按句末标点切；
+    单句仍超限才按长度硬切。绝不从半句话中间下刀——Agent 读到
+    半句话会顺着猜，猜出来的内容会以「视频里说过」的身份混进总结。
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text] if text else []
+    chunks, buf = [], ''
+    for para in text.split('\n\n'):
+        para = para.strip()
+        if not para:
+            continue
+        if len(buf) + len(para) + 2 <= max_chars:
+            buf = f"{buf}\n\n{para}" if buf else para
+            continue
+        if buf:
+            chunks.append(buf)
+            buf = ''
+        if len(para) <= max_chars:
+            buf = para
+            continue
+        # 单段超限：按句末标点切
+        sents = re.findall(r'[^。！？!?…]+[。！？!?…]?|[^。！？!?…]+$', para)
+        for s in sents:
+            s = s.strip()
+            if not s:
+                continue
+            if len(buf) + len(s) <= max_chars:
+                buf += s
+            else:
+                if buf:
+                    chunks.append(buf)
+                # 单句仍超限：硬切（保底，不丢内容）
+                while len(s) > max_chars:
+                    chunks.append(s[:max_chars])
+                    s = s[max_chars:]
+                buf = s
+    if buf:
+        chunks.append(buf)
+    return [c for c in chunks if c.strip()]
 
 
 # ============================================================
@@ -113,16 +217,37 @@ def clean_transcript(raw: str) -> str:
     5. 空白噪声——连续空格、全角空格、首尾空白、中文标点前的多余空格。
     """
     # --- 第一遍：逐行去结构、去标签、去 ASR 幻觉、归一化空白 ---
+    # v1.1 起同时支持 SRT 与 VTT：B站/YouTube 下载的字幕文件大量是 VTT，
+    # 不认 WEBVTT 头、NOTE 块和 cue 标识符的话，这些结构文本会以「正文」
+    # 身份混进总结原料（WEBVTT 里有拉丁字母，去幻觉那关还拦不住它）。
+    raw_lines = raw.splitlines()
     lines = []
-    for ln in raw.splitlines():
+    in_note_block = False
+    for idx, ln in enumerate(raw_lines):
         ln = ln.strip()
         if not ln:
+            in_note_block = False
+            continue
+        if in_note_block:                          # NOTE/STYLE/REGION 块内，跳过
+            continue
+        head = ln.upper()
+        if head.startswith(('NOTE', 'STYLE', 'REGION')):
+            in_note_block = True
+            continue
+        if head.startswith('WEBVTT'):              # 文件头（WEBVTT - 标题）
             continue
         if _SRT_INDEX.match(ln):        # SRT 序号行
             continue
-        if _SRT_TIME.match(ln):         # SRT 时间戳行
+        if _SRT_TIME.match(ln):         # SRT/VTT 时间戳行（VTT 的毫秒用点，正则已兼容）
             continue
-        ln = _HTML_TAG.sub('', ln)      # 去 <font>/<i> 等标签残留
+        # VTT cue 标识符：时间戳行前面那一行独立文本（数字或名称）。
+        # 判据是「下一行是时间戳」——格式良好的 VTT 块间有空行，内容行不会
+        # 直接贴在同一条时间戳前面；宁可放过极少数畸形输入，不错杀正文行。
+        nxt = raw_lines[idx + 1].strip() if idx + 1 < len(raw_lines) else ''
+        if nxt and _SRT_TIME.match(nxt):
+            continue
+        ln = _HTML_TAG.sub('', ln)      # 去 <font>/<i>/<v Speaker> 等标签残留
+        ln = _unescape_entities(ln)     # 去 &amp;/&lt; 等实体（VTT 常见）
         ln = _HALLUCINATION.sub('', ln) # 去日韩假名/音乐符号（ASR 对纯音乐段的幻觉）
         # 去完幻觉字符后，这一行若没有任何 汉字/字母/数字，就是纯噪音行，整行丢。
         # 宁保守勿激进：只要还剩一个汉字或字母就保留（歌词、中英混排都在保护范围）。
@@ -247,20 +372,26 @@ def _display_path(p: str) -> str:
 # 提示词组装
 # ============================================================
 
-def build_brief_input(system_text: str, user_tpl: str, fields: dict) -> str:
+def build_brief_input(system_text: str, user_tpl: str, fields: dict,
+                      note: str = None) -> str:
     """system 全文 + 填好占位符的 user，合成 Agent 可直接使用的输入包。
 
     占位符用逐个 replace 而非 str.format：模板里可能出现其他花括号
     （ASCII 图、代码示例），format 会误伤。
+
+    note：文件头部的用法说明注释。默认（None）是单包模式的三步指引；
+    分段/归并文件由 run() 传各自的说明（见「长视频分段模式」）。
     """
     user_text = user_tpl
     for key, val in fields.items():
         user_text = user_text.replace("{" + key + "}", str(val))
+    if note is None:
+        note = ("用法：把「第一部分」整体作为 system prompt，「第二部分」整体作为 "
+                "user prompt，交给任意 LLM Agent。Agent 产出的 markdown 保存为同目录 "
+                "brief.md，再运行 render.py 生成 HTML。")
     return (
         "<!-- video-brief · 总结用输入包 -->\n"
-        "<!-- 用法：把「第一部分」整体作为 system prompt，「第二部分」整体作为 user prompt，"
-        "交给任意 LLM Agent。Agent 产出的 markdown 保存为同目录 brief.md，"
-        "再运行 render.py 生成 HTML。 -->\n\n"
+        f"<!-- {note} -->\n\n"
         "# 第一部分 · 系统提示词（system prompt）\n\n"
         f"{system_text.strip()}\n\n"
         "---\n\n"
@@ -273,13 +404,30 @@ def build_brief_input(system_text: str, user_tpl: str, fields: dict) -> str:
 # 主流程
 # ============================================================
 
-def run(bvid: str, out_root: str = None, subtitle_file: str = None,
-        page_num: int = None) -> str:
-    if not BV_RE.match(bvid):
-        raise ValueError(f"'{bvid}' 不是合法 BV号（应为 BV + 10 位字母数字）")
+def run(ref: str, out_root: str = None, subtitle_file: str = None,
+        page_num: int = None, chunk_chars: int = None) -> str:
+    # v1.1：输入从「必须是 BV号」放宽到 BV号/av号/任意 B站链接（可带 ?p=N）
+    kind, vid, url_page = parse_video_ref(ref)
+    if chunk_chars is None:
+        chunk_chars = DEFAULT_CHUNK_CHARS
+    if page_num is None:
+        page_num = url_page        # 命令行没显式给分 P 时，URL 里的 ?p= 生效
 
     mod = load_extractor()
-    print(f"BV = {bvid}" + (f"  P{page_num}" if page_num else ""))
+    print(f"输入 = {ref}" + (f"  P{page_num}" if page_num else ""))
+
+    # av 号 → BV 号：B站查接口认 aid，但字幕链路按 BV 组织，先转再走
+    if kind == 'av':
+        try:
+            data = json.loads(mod.http_get(f"https://api.bilibili.com/x/web-interface/view?aid={vid}"))["data"]
+            bvid = (data or {}).get("bvid") or ""
+        except Exception as e:
+            raise RuntimeError(f"av{vid} 转 BV 号失败（{e}）。请直接提供 BV号或视频链接")
+        if not BV_RE.match(bvid):
+            raise RuntimeError(f"av{vid} 转出的 BV 号无效：{bvid!r}。请直接提供 BV号或视频链接")
+        print(f"  av{vid} → {bvid}")
+    else:
+        bvid = vid
 
     # 1. 视频元信息（复用参照一；拿不到就降级，不阻断已有字幕的流程）
     print("[1/4] 获取视频元信息...")
@@ -325,7 +473,7 @@ def run(bvid: str, out_root: str = None, subtitle_file: str = None,
             raw_text = f.read()
 
     # 3. 清洗
-    print("[3/4] 清洗字幕（去时间戳/去重复/合并碎句）...")
+    print("[3/4] 清洗字幕（去时间戳/去结构残留/去重复/合并碎句）...")
     transcript = clean_transcript(raw_text)
     if not transcript.strip():
         raise RuntimeError("清洗后字幕为空：请检查字幕文件是否有内容")
@@ -340,6 +488,11 @@ def run(bvid: str, out_root: str = None, subtitle_file: str = None,
     with open(os.path.join(out_dir, "transcript.txt"), "w", encoding="utf-8") as f:
         f.write(transcript)
 
+    # v1.1 长视频分段：超过阈值就走 map-reduce 两阶段提取。
+    # 切段只影响「提示词怎么组织」，transcript.txt 始终是全量留档。
+    chunks = split_transcript(transcript.strip(), chunk_chars)
+    chunked = len(chunks) > 1
+
     meta = {
         "bvid": bvid,
         "title": title,
@@ -351,17 +504,18 @@ def run(bvid: str, out_root: str = None, subtitle_file: str = None,
         "url": VIDEO_URL.format(bvid=bvid),
         "subtitle_source": source,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "chunked": chunked,
+        "chunk_count": len(chunks),
+        "chunk_chars": chunk_chars if chunked else None,
     }
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    with open(os.path.join(os.path.join(SKILL_DIR, "prompts", "brief-system.md")),
-              "r", encoding="utf-8") as f:
-        system_text = f.read()
-    with open(os.path.join(os.path.join(SKILL_DIR, "prompts", "brief-user.md")),
-              "r", encoding="utf-8") as f:
-        user_tpl = f.read()
+    def _read_prompt(name: str) -> str:
+        with open(os.path.join(SKILL_DIR, "prompts", name), "r", encoding="utf-8") as f:
+            return f.read()
 
+    system_text = _read_prompt("brief-system.md")
     source_note = {
         "cc": "UP主提供的CC字幕（人工或官方生成，准确率较高，"
               "但可能有漏句和口误省略）",
@@ -370,57 +524,148 @@ def run(bvid: str, out_root: str = None, subtitle_file: str = None,
         "user-provided": "使用者提供的外部字幕文件，来源与准确率未知",
     }[source]
 
-    brief_input = build_brief_input(system_text, user_tpl, {
-        "title": title,
-        "up_name": up_name,
-        "duration": meta["duration"],
-        "tname": extra.get("tname", "") or "未知",
-        "url": meta["url"],
-        "subtitle_note": source_note,
-        "transcript": transcript.strip(),
-    })
-    with open(os.path.join(out_dir, "brief-input.md"), "w", encoding="utf-8") as f:
-        f.write(brief_input)
-
-    # 下一步指引
     brief_md = os.path.join(out_dir, "brief.md")
+
+    if not chunked:
+        # ---- 单包模式：一份 brief-input.md 全包 ----
+        user_tpl = _read_prompt("brief-user.md")
+        brief_input = build_brief_input(system_text, user_tpl, {
+            "title": title,
+            "up_name": up_name,
+            "duration": meta["duration"],
+            "tname": extra.get("tname", "") or "未知",
+            "url": meta["url"],
+            "subtitle_note": source_note,
+            "transcript": transcript.strip(),
+        })
+        with open(os.path.join(out_dir, "brief-input.md"), "w", encoding="utf-8") as f:
+            f.write(brief_input)
+
+        print(f"\n[DONE] 输入包已生成: {out_dir}")
+        print(f"  transcript.txt   ← 清洗后的字幕（{len(transcript)} 字）")
+        print(f"  meta.json        ← 视频元信息")
+        print(f"  brief-input.md   ← 完整提示词（system + user）")
+        print("\n[NEXT] 接下来：")
+        print(f"  1. 把 brief-input.md 的第一部分作为 system prompt、第二部分作为 user prompt，")
+        print(f"     交给任意 LLM Agent，得到教学式总结（markdown）")
+        print(f"  2. 把总结保存为: {brief_md}")
+        print(f"  3. 运行: python render.py {_display_path(brief_md)}")
+        print(f"     （render.py 会自动读取同目录 meta.json 生成视频信息头）")
+        return out_dir
+
+    # ---- 分段模式（v1.1）：map 每段一份提示词，reduce 一份归并提示词 ----
+    print(f"  字幕 {len(transcript)} 字超过分段阈值 {chunk_chars}，"
+          f"切成 {len(chunks)} 段走两阶段提取")
+    chunk_user_tpl = _read_prompt("brief-chunk-user.md")
+    merge_user_tpl = _read_prompt("brief-merge-user.md")
+    chunks_dir = os.path.join(out_dir, "chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    for i, ch in enumerate(chunks, 1):
+        chunk_input = build_brief_input(system_text, chunk_user_tpl, {
+            "title": title,
+            "seg_no": i,
+            "seg_total": len(chunks),
+            "subtitle_note": source_note,
+            "transcript": ch,
+        }, note=(f"第 {i}/{len(chunks)} 段的分段笔记任务：把「第一部分」作为 system "
+                 f"prompt、「第二部分」作为 user prompt 交给 LLM Agent，产出该段的"
+                 f"分段笔记（markdown），保存为同目录 note-{i}.md。"))
+        with open(os.path.join(chunks_dir, f"chunk-{i}.md"), "w", encoding="utf-8") as f:
+            f.write(chunk_input)
+
+    merge_input = build_brief_input(system_text, merge_user_tpl, {
+        "title": title,
+        "chunk_count": len(chunks),
+        "chunk_notes": (
+            f"（此处粘贴 {len(chunks)} 份分段笔记：按 note-1.md 到 "
+            f"note-{len(chunks)}.md 的顺序，整份替换本段说明）"),
+    }, note=("归并阶段：先把「第二部分」「分段笔记」一节的占位说明替换成按顺序贴齐的"
+             "全部分段笔记，再把「第一部分」作为 system prompt、「第二部分」作为 "
+             "user prompt 交给 LLM Agent，产出最终教学式总结（markdown），保存为同目录 "
+             "brief.md，再运行 render.py 生成 HTML。"))
+    with open(os.path.join(out_dir, "brief-merge.md"), "w", encoding="utf-8") as f:
+        f.write(merge_input)
+
+    # brief-input.md 在分段模式下降级为使用说明（提示词本体在 chunks/ 与 brief-merge.md）
+    usage = f"""# video-brief · 长视频分段模式使用说明
+
+本视频清洗后字幕 {len(transcript)} 字，超过分段阈值 {chunk_chars} 字，已切成
+{len(chunks)} 段走两阶段提取（map-reduce）。单 prompt 塞进整段长视频，要么爆上下文，
+要么模型 lost-in-the-middle 丢掉中段；分段提炼再归并，是 bili-subtitle 项目
+验证过的路子。
+
+## 产物清单
+
+| 文件 | 是什么 |
+| --- | --- |
+| `transcript.txt` | 清洗后的全量字幕（留档，不直接进提示词） |
+| `meta.json` | 视频元信息 |
+| `chunks/chunk-1.md` … `chunks/chunk-{len(chunks)}.md` | 每段一份提示词（system + user） |
+| `chunks/note-1.md` … `note-{len(chunks)}.md` | 分段笔记（你跑 Agent 后自己保存） |
+| `brief-merge.md` | 归并阶段提示词（占位说明待替换） |
+
+## 两步流程
+
+1. **分段提炼（map）**：把 `chunks/chunk-1.md` 到 `chunks/chunk-{len(chunks)}.md`
+   依次交给 LLM Agent（每份的第一部分作 system prompt、第二部分作 user prompt），
+   每份产出该段的分段笔记（markdown），保存为 `chunks/note-1.md` 到
+   `chunks/note-{len(chunks)}.md`。
+2. **归并成稿（reduce）**：打开 `brief-merge.md`，把 {len(chunks)} 份笔记按顺序
+   粘贴进「分段笔记」一节（替换占位说明），整体交给 LLM Agent，
+   得到最终教学式总结（markdown）。
+3. 把总结保存为 `brief.md`，运行 `python render.py brief.md` 生成 HTML
+   （render.py 会自动读取同目录 meta.json 生成视频信息头）。
+
+分段阈值可用 `--chunk-chars` 调整；`--chunk-chars 0` 关闭分段，回到单包模式。
+"""
+    with open(os.path.join(out_dir, "brief-input.md"), "w", encoding="utf-8") as f:
+        f.write(usage)
+
     print(f"\n[DONE] 输入包已生成: {out_dir}")
-    print(f"  transcript.txt   ← 清洗后的字幕（{len(transcript)} 字）")
-    print(f"  meta.json        ← 视频元信息")
-    print(f"  brief-input.md   ← 完整提示词（system + user）")
-    print("\n[NEXT] 接下来：")
-    print(f"  1. 把 brief-input.md 的第一部分作为 system prompt、第二部分作为 user prompt，")
-    print(f"     交给任意 LLM Agent，得到教学式总结（markdown）")
-    print(f"  2. 把总结保存为: {brief_md}")
-    print(f"  3. 运行: python render.py {_display_path(brief_md)}")
-    print(f"     （render.py 会自动读取同目录 meta.json 生成视频信息头）")
+    print(f"  transcript.txt      ← 清洗后的字幕（{len(transcript)} 字，全量留档）")
+    print(f"  meta.json           ← 视频元信息（chunked=true，{len(chunks)} 段）")
+    print(f"  chunks/chunk-*.md   ← {len(chunks)} 份分段提示词（分段提炼用）")
+    print(f"  brief-merge.md      ← 归并提示词（笔记粘贴后出终稿）")
+    print(f"  brief-input.md      ← 使用说明（两步流程）")
+    print("\n[NEXT] 长视频分段模式：")
+    print(f"  1. 依次把 chunks/chunk-1.md … chunk-{len(chunks)}.md 交给 LLM Agent，")
+    print(f"     每份产出分段笔记，保存为 chunks/note-1.md … note-{len(chunks)}.md")
+    print(f"  2. 把 {len(chunks)} 份笔记按顺序粘贴进 brief-merge.md 第二部分的")
+    print(f"     「分段笔记」一节，整体交给 LLM Agent，得到最终教学式总结")
+    print(f"  3. 把总结保存为: {brief_md}")
+    print(f"  4. 运行: python render.py {_display_path(brief_md)}")
     return out_dir
 
 
 def main():
     ap = argparse.ArgumentParser(
         prog="video_brief.py",
-        description="video-brief 第一步：BV号 → 字幕 → 清洗 → 生成「总结用输入包」。"
+        description="video-brief 第一步：BV号/av号/链接 → 字幕 → 清洗 → 生成「总结用输入包」。"
                     "总结内容由 Agent 按教学方法论撰写，本脚本不写总结。",
         epilog="示例: python video_brief.py BV1a14y187qn  "
-               "python video_brief.py BV1a14y187qn --subtitle ./已有字幕.srt",
+               "python video_brief.py BV1a14y187qn --subtitle ./已有字幕.vtt  "
+               "python video_brief.py https://www.bilibili.com/video/BV1a14y187qn/?p=3",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("bvid", nargs="?", help="B站视频BV号，如 BV1a14y187qn")
+    ap.add_argument("ref", nargs="?", help="B站视频BV号/av号/视频链接（链接可带 ?p=N）")
     ap.add_argument("--out", default=None,
                     help="输出根目录（默认 <skill目录>/output）")
     ap.add_argument("--subtitle", default=None,
-                    help="已有字幕文件（.srt/.txt），提供则跳过抓取")
+                    help="已有字幕文件（.srt/.vtt/.txt），提供则跳过抓取")
     ap.add_argument("--page", type=int, default=None,
-                    help="多P视频的分P号（默认第1P）")
+                    help="多P视频的分P号（默认第1P；链接里带 ?p=N 时以链接为准）")
+    ap.add_argument("--chunk-chars", type=int, default=None, metavar="N",
+                    help="长视频分段阈值：清洗后字幕超过 N 字就切段做两阶段提取"
+                         "（默认 15000；0 = 关闭分段，强制单包）")
     args = ap.parse_args()
 
-    if not args.bvid:
+    if not args.ref:
         ap.print_help()
         sys.exit(2)
 
     try:
-        run(args.bvid, out_root=args.out, subtitle_file=args.subtitle,
-            page_num=args.page)
+        run(args.ref, out_root=args.out, subtitle_file=args.subtitle,
+            page_num=args.page, chunk_chars=args.chunk_chars)
     except Exception as e:
         print(f"\n[FAILED] {e}")
         sys.exit(1)
