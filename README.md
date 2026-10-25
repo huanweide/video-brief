@@ -147,3 +147,11 @@ output/BV号_标题/
 （`prompts/brief-merge-user.md`）负责去重、跨段重组、保留存疑、承认缺口。
 切点优先落在段尾，单段超限按句末标点切，绝不从半句话中间下刀——
 Agent 读到半句话会顺着猜，猜出来的内容会以「视频里说过」的身份混进总结。
+## 🧰 同一作者的其他工具
+
+如果你在做视频 / 字幕 / 学习相关的事，这些项目可能也用得上：
+
+- 🎬 字幕 / 视频：[bili-subtitle-universal](https://github.com/huanweide/bili-subtitle-universal)（B 站字幕批量提取）· [live-subtitle](https://github.com/huanweide/live-subtitle)（实时语音转字幕）
+- 📚 长篇创作（AI 小说工坊）：[novel-smith](https://github.com/huanweide/novel-smith)
+- 🧠 网课助手（智慧树自动答题）：[zhihuishu-helper](https://github.com/huanweide/zhihuishu-helper)
+- 🩺 代码健康全家桶（18 轴零依赖 CLI）：[family-showcase](https://github.com/huanweide/family-showcase)
