@@ -149,9 +149,11 @@ output/BV号_标题/
 Agent 读到半句话会顺着猜，猜出来的内容会以「视频里说过」的身份混进总结。
 ## 🧰 同一作者的其他工具
 
-如果你在做视频 / 字幕 / 学习相关的事，这些项目可能也用得上：
+> 作者在做一系列开源效率工具，欢迎顺手点 Star 支持：
 
-- 🎬 字幕 / 视频：[bili-subtitle-universal](https://github.com/huanweide/bili-subtitle-universal)（B 站字幕批量提取）· [live-subtitle](https://github.com/huanweide/live-subtitle)（实时语音转字幕）
-- 📚 长篇创作（AI 小说工坊）：[novel-smith](https://github.com/huanweide/novel-smith)
-- 🧠 网课助手（智慧树自动答题）：[zhihuishu-helper](https://github.com/huanweide/zhihuishu-helper)
-- 🩺 代码健康全家桶（18 轴零依赖 CLI）：[family-showcase](https://github.com/huanweide/family-showcase)
+- 📚 长篇创作 — AI 小说工坊，本地规则引擎零依赖：[点此访问](https://github.com/huanweide/novel-smith)
+- 🎓 网课助手 — 智慧树自动播放/续播/AI 答题：[点此访问](https://github.com/huanweide/zhihuishu-helper)
+- 🎬 字幕/视频 — B站字幕一键提取（零 Key 取官方字幕）：[点此访问](https://github.com/huanweide/bili-subtitle-universal)
+- 📺 实时字幕 — 直播/会议实时字幕：[点此访问](https://github.com/huanweide/live-subtitle)
+- 🖥️ 总览 — 作者全部开源项目集散：[点此访问](https://github.com/huanweide/family-showcase)
+- 🩺 代码健康 — 零依赖多轴静态体检：[点此访问](https://github.com/huanweide/doctors)
