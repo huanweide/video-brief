@@ -1,4 +1,13 @@
+<!-- badges -->
+[![License](https://img.shields.io/github/license/huanweide/video-brief)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/huanweide/video-brief)](https://github.com/huanweide/video-brief/stargazers)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Deps](https://img.shields.io/badge/core-zero--stdlib-4ecca3)](https://github.com/huanweide/video-brief)
+<!-- /badges -->
+
 # video-brief · 视频总结器
+
+> **English TL;DR:** Turn any Bilibili video into a *teaching-style* rewrite, not a shallow summary. Feed a BV id → fetch/transcribe subtitles → clean them → assemble a teaching-method prompt pack → you (or any LLM agent) write the brief → render to a single portable HTML. Long videos auto-chunk (map-reduce) so the middle never gets lost.
 
 输入一个 B站 BV号/av号/视频链接，拿到字幕，按教学方法论写一份教学式总结，
 渲染成一份清爽的单文件 HTML。长视频自动分段做两阶段提取，不丢中段。
@@ -43,6 +52,15 @@ BV号 ──① 取字幕──> 原料字幕 ──② 清洗──> 纯文本 
 单 prompt 塞整节课要么爆上下文、要么模型 lost-in-the-middle 丢中段。
 此时自动切成两阶段：每段一份提示词单独提炼成分段笔记，再把 N 份笔记
 归并成终稿。这是 bili-subtitle 项目验证过的 map-reduce 路子。
+
+## 安装
+
+```bash
+git clone https://github.com/huanweide/video-brief.git
+cd video-brief
+# 核心零第三方依赖（清洗 / 渲染纯 Python 标准库）；无 CC 字幕走 ASR 时复用 bili-subtitle-extractor 链路
+# 可选：无字幕音频转码需要 ffmpeg（Windows: winget install Gyan.FFmpeg / macOS: brew install ffmpeg / Linux: sudo apt install ffmpeg）
+```
 
 ## 快速开始
 
@@ -147,6 +165,18 @@ output/BV号_标题/
 （`prompts/brief-merge-user.md`）负责去重、跨段重组、保留存疑、承认缺口。
 切点优先落在段尾，单段超限按句末标点切，绝不从半句话中间下刀——
 Agent 读到半句话会顺着猜，猜出来的内容会以「视频里说过」的身份混进总结。
+## 效果预览
+
+> 截图待补。下面是一次真实运行的产物结构（单文件 HTML，CSS 内联，拷走即看）：
+
+```
+output/BV1a14y187qn_标题/
+├── brief.html   # 教学式总结：体系骨架 + 逐概念推导 + 疑点覆盖 + 可复现收口
+└── brief.md     # 同一份总结的 Markdown 源
+```
+
+把 `brief.html` 发给朋友或存进个人知识库，一个文件带走全部内容。
+
 ## 🧰 同一作者的其他工具
 
 > 作者在做一系列开源效率工具，欢迎顺手点 Star 支持：
