@@ -1,5 +1,14 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="video-brief">
+</p>
+
+<p align="center">
+  <a href="#一句话定位">30 秒看懂</a> · <a href="#三步流程">流程</a> · <a href="#快速开始">快速开始</a> · <a href="#设计取舍">架构</a> · <a href="#当前不能做什么">边界</a>
+</p>
+
 <!-- badges -->
 [![License](https://img.shields.io/github/license/huanweide/video-brief)](LICENSE)
+[![CI](https://github.com/huanweide/video-brief/actions/workflows/ci.yml/badge.svg)](https://github.com/huanweide/video-brief/actions/workflows/ci.yml)
 [![Stars](https://img.shields.io/github/stars/huanweide/video-brief)](https://github.com/huanweide/video-brief/stargazers)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Deps](https://img.shields.io/badge/core-zero--stdlib-4ecca3)](https://github.com/huanweide/video-brief)
