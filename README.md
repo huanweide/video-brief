@@ -1,3 +1,5 @@
+**English** · [README_EN.md](./README_EN.md)
+
 <p align="center">
   <img src="assets/banner.svg" alt="video-brief">
 </p>
